@@ -1,4 +1,4 @@
-import { neon } from "@neondatabase/serverless";
+import { Pool } from "pg";
 
 const TAMANO_MAXIMO_FOTO = 2 * 1024 * 1024;
 const FOTO_BASE64 = /^data:image\/(?:jpeg|png|webp);base64,([A-Za-z0-9+/]+={0,2})$/;
@@ -11,28 +11,47 @@ type DatosInstrumento = {
   foto: string;
 };
 
-function obtenerSql() {
+declare global {
+  var __supabasePgPool: Pool | undefined;
+}
+
+function obtenerPool(): Pool {
   const connectionString = process.env.POSTGRES_URL ?? process.env.DATABASE_URL;
   if (!connectionString) {
     throw new Error("Falta configurar POSTGRES_URL o DATABASE_URL.");
   }
 
-  return neon(connectionString);
+  if (!globalThis.__supabasePgPool) {
+    const necesitaSsl =
+      connectionString.includes("supabase.co") ||
+      connectionString.includes("pooler.supabase.com") ||
+      connectionString.includes("sslmode=require");
+
+    globalThis.__supabasePgPool = new Pool({
+      connectionString,
+      ssl: necesitaSsl ? { rejectUnauthorized: false } : undefined,
+    });
+  }
+
+  return globalThis.__supabasePgPool;
 }
 
 let inicializacionTabla: Promise<void> | null = null;
 
-function asegurarTabla() {
+function asegurarTabla(): Promise<void> {
   if (!inicializacionTabla) {
-    inicializacionTabla = obtenerSql()`CREATE TABLE IF NOT EXISTS instrumentos (
-      id SERIAL PRIMARY KEY,
-      persona VARCHAR(120) NOT NULL,
-      instrumento VARCHAR(150) NOT NULL,
-      nro_parte VARCHAR(100) NOT NULL,
-      nro_serie VARCHAR(100) NOT NULL,
-      foto TEXT NOT NULL,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )`
+    inicializacionTabla = obtenerPool()
+      .query(`
+        CREATE TABLE IF NOT EXISTS instrumentos (
+          id SERIAL PRIMARY KEY,
+          persona VARCHAR(120) NOT NULL,
+          instrumento VARCHAR(150) NOT NULL,
+          nro_parte VARCHAR(100) NOT NULL,
+          nro_serie VARCHAR(100) NOT NULL,
+          foto TEXT NOT NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+      `)
       .then(() => undefined)
       .catch((cause: unknown) => {
         inicializacionTabla = null;
@@ -112,14 +131,14 @@ function errorInterno(cause: unknown) {
 export async function GET() {
   try {
     await asegurarTabla();
-    const sql = obtenerSql();
-    const instrumentos = await sql`
+    const pool = obtenerPool();
+    const { rows } = await pool.query(`
       SELECT id, persona, instrumento, nro_parte, nro_serie, foto, created_at
       FROM instrumentos
       ORDER BY id DESC
-    `;
+    `);
 
-    return Response.json(instrumentos);
+    return Response.json(rows);
   } catch (cause) {
     return errorInterno(cause);
   }
@@ -142,14 +161,17 @@ export async function POST(request: Request) {
 
   try {
     await asegurarTabla();
-    const sql = obtenerSql();
-    const [instrumento] = await sql`
-      INSERT INTO instrumentos (persona, instrumento, nro_parte, nro_serie, foto)
-      VALUES (${datos.persona}, ${datos.instrumento}, ${datos.nro_parte}, ${datos.nro_serie}, ${datos.foto})
-      RETURNING id, persona, instrumento, nro_parte, nro_serie, foto, created_at
-    `;
+    const pool = obtenerPool();
+    const { rows } = await pool.query(
+      `
+        INSERT INTO instrumentos (persona, instrumento, nro_parte, nro_serie, foto)
+        VALUES ($1, $2, $3, $4, $5)
+        RETURNING id, persona, instrumento, nro_parte, nro_serie, foto, created_at
+      `,
+      [datos.persona, datos.instrumento, datos.nro_parte, datos.nro_serie, datos.foto],
+    );
 
-    return Response.json(instrumento, { status: 201 });
+    return Response.json(rows[0], { status: 201 });
   } catch (cause) {
     return errorInterno(cause);
   }
@@ -173,26 +195,29 @@ export async function PUT(request: Request) {
 
   try {
     await asegurarTabla();
-    const sql = obtenerSql();
-    const [instrumento] = await sql`
-      UPDATE instrumentos
-      SET persona = ${datos.persona},
-          instrumento = ${datos.instrumento},
-          nro_parte = ${datos.nro_parte},
-          nro_serie = ${datos.nro_serie},
-          foto = ${datos.foto}
-      WHERE id = ${id}
-      RETURNING id, persona, instrumento, nro_parte, nro_serie, foto, created_at
-    `;
+    const pool = obtenerPool();
+    const { rows } = await pool.query(
+      `
+        UPDATE instrumentos
+        SET persona = $1,
+            instrumento = $2,
+            nro_parte = $3,
+            nro_serie = $4,
+            foto = $5
+        WHERE id = $6
+        RETURNING id, persona, instrumento, nro_parte, nro_serie, foto, created_at
+      `,
+      [datos.persona, datos.instrumento, datos.nro_parte, datos.nro_serie, datos.foto, id],
+    );
 
-    if (!instrumento) {
+    if (!rows[0]) {
       return Response.json(
         { error: "No se encontró el instrumento solicitado." },
         { status: 404 },
       );
     }
 
-    return Response.json(instrumento);
+    return Response.json(rows[0]);
   } catch (cause) {
     return errorInterno(cause);
   }
@@ -206,21 +231,24 @@ export async function DELETE(request: Request) {
 
   try {
     await asegurarTabla();
-    const sql = obtenerSql();
-    const [eliminado] = await sql`
-      DELETE FROM instrumentos
-      WHERE id = ${id}
-      RETURNING id
-    `;
+    const pool = obtenerPool();
+    const { rows } = await pool.query(
+      `
+        DELETE FROM instrumentos
+        WHERE id = $1
+        RETURNING id
+      `,
+      [id],
+    );
 
-    if (!eliminado) {
+    if (!rows[0]) {
       return Response.json(
         { error: "No se encontró el instrumento solicitado." },
         { status: 404 },
       );
     }
 
-    return Response.json({ id: eliminado.id });
+    return Response.json({ id: rows[0].id });
   } catch (cause) {
     return errorInterno(cause);
   }
